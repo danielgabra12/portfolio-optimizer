@@ -1,0 +1,577 @@
+import os, sys, re, glob, numpy as np, pandas as pd, warnings
+from pathlib import Path
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from pandas.tseries.offsets import BDay
+import matplotlib.pyplot as plt
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.tsa.forecasting.theta import ThetaModel
+from joblib import Parallel, delayed
+
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
+warnings.filterwarnings("ignore", message="A date index has been provided, but it has no associated frequency")
+warnings.filterwarnings("ignore", message="No supported index is available")
+warnings.filterwarnings("ignore", message="Maximum Likelihood optimization failed to converge")
+warnings.filterwarnings("ignore", message="Too few observations")
+
+TARGET_PATTERNS = ["Portfolio Optimization*.xlsx","Portfolio Optimization*.xlsm","Portfolio Optimization*.xls"]
+
+def resolve_excel():
+    desktop = Path(r"C:\Users\Daniel\OneDrive\Desktop")
+    candidates = [
+        desktop / "Portfolio Optimization .xlsx",
+        desktop / "Portfolio Optimization.xlsx",
+        desktop / "Portfolio Optimization.xlsm",
+        desktop / "Portfolio Optimization.xls",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    found = []
+    for pat in ("Portfolio Optimization*.xls*", "*.xls*", "*Optimization*.xls*"):
+        found += list(desktop.glob(pat))
+    if found:
+        found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return str(found[0])
+    print("Excel not found on Desktop.")
+    sys.exit(1)
+
+EXCEL_PATH = resolve_excel()
+H = 20
+MIN_OBS = 252
+# keep in the same place where ORDERS is defined
+ORDERS = [(p,d,q) for p in range(3) for d in (0,1) for q in range(3) if not (p==0 and d==0 and q==0)]
+# previously p,q in range(4) → now 0..2 (cuts candidates by ~44%)
+
+def load_wide_if_any(xls):
+    for sh, df in xls.items():
+        if df.shape[1] >= 2:
+            first = str(df.columns[0]).strip().lower()
+            if "date" in first or "time" in first:
+                d = pd.to_datetime(df.iloc[:,0], errors="coerce", format="mixed")
+                vals = df.iloc[:,1:].apply(pd.to_numeric, errors="coerce")
+                out = pd.concat([d, vals], axis=1).dropna(subset=[d.name])
+                out = out.set_index(d.name).sort_index()
+                out.index.name = "date"
+                out.columns = [str(c).strip().upper().replace(" ", "_") for c in out.columns]
+                if out.notna().sum().sum() > 0:
+                    return out
+    return None
+
+def load_paired_long(xls):
+    rec = []
+    for sh, df in xls.items():
+        cols = list(df.columns); i = 0
+        while i < len(cols)-1:
+            L, R = cols[i], cols[i+1]
+            if not str(L).lower().startswith("unnamed"):
+                dser = pd.to_datetime(df[L], errors="coerce", format="mixed")
+                pser = pd.to_numeric(df[R], errors="coerce")
+                if dser.notna().sum() >= 5 and pser.notna().sum() >= 5:
+                    t = re.sub(r"[^A-Za-z0-9_.-]", "", str(L)).upper()
+                    tmp = pd.DataFrame({"ticker": t, "date": dser, "price": pser}).dropna(subset=["date","price"])
+                    if not tmp.empty and t:
+                        rec.append(tmp); i += 2; continue
+            i += 1
+    if not rec:
+        return None
+    long_df = pd.concat(rec, ignore_index=True)
+    panel = long_df.pivot_table(index="date", columns="ticker", values="price", aggfunc="last").sort_index()
+    panel.index = pd.to_datetime(panel.index)
+    return panel
+
+def load_panel(path):
+    xls = pd.read_excel(path, sheet_name=None)
+    panel = load_wide_if_any(xls)
+    if panel is None:
+        panel = load_paired_long(xls)
+    if panel is None or panel.empty:
+        print("No valid time series found in workbook."); sys.exit(1)
+    return panel
+
+def enforce_bday_freq(s):
+    if not isinstance(s.index, pd.DatetimeIndex):
+        s.index = pd.to_datetime(s.index, errors="coerce")
+    s = s[~s.index.isna()]
+    s = s.sort_index()
+    s = s.asfreq("B")
+    s = s.ffill()
+    return s
+
+def best_arima_order(y):
+    best = None; best_aic = np.inf
+    for p,d,q in ORDERS:
+        try:
+            res = SARIMAX(y, order=(p,d,q), trend="c",
+              enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+            if res.aic < best_aic:
+                best_aic = res.aic; best = (p,d,q,res)
+        except:
+            pass
+    return best
+
+def clean_universe(panel):
+    panel = panel.apply(pd.to_numeric, errors="coerce")
+    panel = panel.loc[:, panel.std(skipna=True) > 0]
+    panel = panel.loc[:, panel.notna().sum() >= MIN_OBS]
+    return panel
+
+def align_and_forecast(panel, steps):
+    panel = clean_universe(panel)
+    last_dates = {}; models = {}
+    for t in panel.columns:
+        y = panel[t].dropna()
+        y = enforce_bday_freq(y)
+        if y.shape[0] < MIN_OBS: continue
+        sel = best_arima_order(y)
+        if sel is None: continue
+        p,d,q,res = sel
+        last_dates[t] = y.index.max()
+        models[t] = (p,d,q,res)
+    common_start = max(last_dates.values()) + BDay()
+    idx_common = pd.bdate_range(common_start, periods=steps)
+    frames = {}; rows = []
+    for t,(p,d,q,res) in models.items():
+        k = (common_start - last_dates[t]).days
+        add_steps = max(steps + k, steps)
+        sf = res.get_forecast(steps=add_steps).summary_frame()
+        if not isinstance(sf.index, pd.DatetimeIndex):
+            sf.index = pd.bdate_range(last_dates[t] + BDay(), periods=add_steps)
+        sf = sf.iloc[k:steps+k]
+        sf.index = idx_common
+        df = sf[["mean","mean_ci_lower","mean_ci_upper"]].rename(
+            columns={"mean":"forecast","mean_ci_lower":"ci_lower","mean_ci_upper":"ci_upper"})
+        df.columns = pd.MultiIndex.from_product([[t], df.columns])
+        frames[t] = df
+        rows.append((t, models[t][3].aic, (p,d,q)))
+    out = pd.concat(frames.values(), axis=1).reindex(idx_common)
+    rank = pd.DataFrame(rows, columns=["ticker","aic","order"]).sort_values("aic")
+    return out, rank
+
+# ---- Historical forecast for SPY ----
+def historical_forecast(panel, ticker, asof_date, months_ahead=3, use_log=True):
+    y = panel[ticker].dropna()
+    y = enforce_bday_freq(y)
+    cutoff = pd.to_datetime(asof_date)
+    y_train = y.loc[:cutoff]
+    if use_log:
+        y_train = np.log(y_train)
+    sel = best_arima_order(y_train)
+    if sel is None:
+        raise RuntimeError("No ARIMA model fit")
+    p,d,q,res = sel
+    fc = res.get_forecast(steps=months_ahead*21).summary_frame()
+    if use_log:
+        fc[["mean","mean_ci_lower","mean_ci_upper"]] = np.exp(fc[["mean","mean_ci_lower","mean_ci_upper"]])
+    fc = fc.rename(columns={"mean":"forecast","mean_ci_lower":"ci_lower","mean_ci_upper":"ci_upper"})
+    actual = y.loc[fc.index.min():fc.index.max()]
+    fc["actual"] = actual
+    fc["error"] = fc["forecast"] - fc["actual"]
+    return fc, sel
+
+panel = load_panel(EXCEL_PATH).sort_index()
+panel.index.name = "date"
+
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.tsa.forecasting.theta import ThetaModel
+
+# ---------- Metrics ----------
+def _rmse(y_true, y_pred):
+    err = y_pred - y_true
+    return np.sqrt(np.nanmean(err**2))
+
+def _mape(y_true, y_pred, eps=1e-12):
+    # percentage error; guard against zeros
+    denom = np.maximum(np.abs(y_true), eps)
+    return np.nanmean(np.abs((y_pred - y_true) / denom)) * 100.0
+
+def _smape(y_true, y_pred, eps=1e-12):
+    denom = (np.abs(y_true) + np.abs(y_pred)) / 2.0
+    denom = np.maximum(denom, eps)
+    return np.nanmean(np.abs(y_pred - y_true) / denom) * 100.0
+
+# ---------- Model wrappers ----------
+def _fit_forecast_arima(y_train, steps):
+    sel = best_arima_order(y_train)  # uses your grid + AIC
+    if sel is None:
+        return None, None, None
+    p,d,q,res = sel
+    sf = res.get_forecast(steps=steps).summary_frame()
+    yhat = sf["mean"].to_numpy()
+    # basic PI from statsmodels (already computed)
+    lo = sf["mean_ci_lower"].to_numpy()
+    hi = sf["mean_ci_upper"].to_numpy()
+    return yhat, lo, hi
+
+def _fit_forecast_holtdamped(y_train, steps):
+    # prices are often better in logs; if series is strictly positive, use log
+    use_log = (y_train.min() > 0)
+    yt = np.log(y_train) if use_log else y_train
+    mdl = ExponentialSmoothing(yt, trend="add", damped_trend=True, seasonal=None)
+    res = mdl.fit(optimized=True)
+    f = res.forecast(steps=steps).to_numpy()
+    if use_log:
+        f = np.exp(f)
+    # crude, constant-variance PI using in-sample residuals
+    resid = (np.exp(res.fittedvalues) if use_log else res.fittedvalues) - y_train
+    s = np.nanstd(resid)
+    lo = f - 1.96*s
+    hi = f + 1.96*s
+    return f, lo, hi
+
+def _fit_forecast_theta(y_train, steps):
+    # Defensive Theta to reduce NaNs/failures
+    y_train = pd.Series(y_train, dtype=float).dropna()
+    if y_train.size < 20:
+        raise ValueError("ThetaModel: too few observations")
+
+    use_log = (y_train.min() > 0)
+    yt = np.log(y_train) if use_log else y_train
+
+    # Disable deseasonalize for daily/BDay data
+    mdl = ThetaModel(yt, deseasonalize=False)
+    res = mdl.fit()
+
+    f = np.asarray(res.forecast(steps), dtype=float)
+    if use_log:
+        f = np.exp(f)
+
+    # Simple PI from residual std (crude but serviceable for ranking)
+    fitted = np.asarray(res.fittedvalues, dtype=float)
+    if use_log:
+        fitted = np.exp(fitted)
+    resid = fitted - y_train.to_numpy()
+    s = float(np.nanstd(resid)) if np.isfinite(resid).any() else 0.0
+
+    lo = f - 1.96 * s
+    hi = f + 1.96 * s
+    return f, lo, hi
+
+
+MODEL_REGISTRY = {
+    "arima": _fit_forecast_arima,
+    "holt_damped": _fit_forecast_holtdamped,
+    "theta": _fit_forecast_theta,
+}
+
+# ---------- Rolling-origin backtest for ONE ticker ----------
+def backtest_models_for_ticker(panel, ticker, models=("arima","holt_damped","theta"),
+                               horizon=20, n_origins=5, min_obs=MIN_OBS):
+    """
+    For a single ticker: pick n_origins rolling 'as-of' dates near the end,
+    forecast 'horizon' steps ahead, compute errors for each model.
+    Returns: (metrics_df, per_origin_details)
+    """
+    if ticker not in panel.columns:
+        raise ValueError(f"{ticker} not in panel")
+    y = enforce_bday_freq(panel[ticker].dropna())
+    if y.shape[0] < max(min_obs, horizon + 10):
+        raise ValueError(f"Not enough data for {ticker}")
+
+    # choose recent origins spaced across the last segment of the series
+    last_idx = y.index[y.shape[0]-horizon-1]  # ensure room for horizon
+    # pick n_origins equally spaced between min_obs and len-horizon-1
+    start_i = min_obs
+    end_i = y.shape[0] - horizon - 1
+    idx_candidates = np.linspace(start_i, end_i, num=n_origins, dtype=int)
+
+    rows = []
+    details = []  # store per-origin, per-model forecasts if you want to inspect
+    for cut_i in idx_candidates:
+        cut_date = y.index[cut_i]
+        y_train = y.loc[:cut_date]
+        y_test  = y.iloc[cut_i+1 : cut_i+1+horizon]  # actuals to compare
+
+        for m in models:
+            f = MODEL_REGISTRY[m]
+            try:
+                yhat, lo, hi = f(y_train, horizon)
+                # align shapes defensively
+                yhat = np.asarray(yhat)[:len(y_test)]
+                met = {
+                    "ticker": ticker,
+                    "model": m,
+                    "origin": cut_date,
+                    "rmse": _rmse(y_test.to_numpy(), yhat),
+                    "mape": _mape(y_test.to_numpy(), yhat),
+                    "smape": _smape(y_test.to_numpy(), yhat),
+                }
+                rows.append(met)
+                details.append({"ticker":ticker,"model":m,"origin":cut_date,
+                                "y_test":y_test, "yhat":yhat})
+            except Exception as e:
+                rows.append({"ticker":ticker,"model":m,"origin":cut_date,
+                             "rmse":np.nan,"mape":np.nan,"smape":np.nan})
+                continue
+
+    metrics = pd.DataFrame(rows)
+    summary = (metrics.groupby(["ticker","model"])
+                      .agg(rmse=("rmse","mean"),
+                           mape=("mape","mean"),
+                           smape=("smape","mean"))
+                      .reset_index()
+                      .sort_values("smape"))
+    return summary, metrics
+
+# ---------- Select best model & produce final forecast for ONE ticker ----------
+def forecast_with_best_model(panel, ticker, horizon=20, prefer_metric="smape",
+                             candidate_models=("arima","holt_damped","theta")):
+    summary, _ = backtest_models_for_ticker(panel, ticker, candidate_models, horizon=horizon)
+    if summary.empty or summary[prefer_metric].isna().all():
+        raise RuntimeError(f"All models failed backtest for {ticker}")
+    best_model = summary.sort_values(prefer_metric).iloc[0]["model"]
+    # fit on full history and forecast
+    y = enforce_bday_freq(panel[ticker].dropna())
+    yhat, lo, hi = MODEL_REGISTRY[best_model](y, horizon)
+    # build a DataFrame with same structure as your align_and_forecast output per-ticker
+    idx = pd.bdate_range(y.index.max() + BDay(), periods=horizon)
+    out = pd.DataFrame({"forecast": yhat, "ci_lower": lo, "ci_upper": hi}, index=idx)
+    return best_model, out
+
+# Example: compare on SPY and then produce the chosen forecast
+summary_spy, metrics_spy = backtest_models_for_ticker(panel, "SPY", horizon=H, n_origins=6)
+print("\nMODEL COMPARISON (SPY):")
+print(summary_spy.to_string(index=False))
+
+best_model, spy_fc = forecast_with_best_model(panel, "SPY", horizon=H)
+print(f"\nBest model for SPY: {best_model}")
+print(spy_fc.head())
+
+# ---------- Helper: convert price forecasts to returns ----------
+def _to_returns(df_prices):
+    # pct_change along rows, within each ticker block of MultiIndex columns
+    parts = []
+    for t in df_prices.columns.levels[0]:
+        p = df_prices[t]["forecast"].copy()
+        r = p.pct_change().rename(t)  # daily expected % change from forecast path
+        parts.append(r)
+    rets = pd.concat(parts, axis=1)
+    return rets
+
+def _to_cum_returns(df_returns):
+    # cumulative product of (1+r) - 1
+    return (1 + df_returns).cumprod() - 1
+
+# ---------- Helper: build signals from forecast vs last actual ----------
+def build_signals(fc_prices, last_actuals, model_rank,
+                  horizon_policy="point",  # "point", "lower_ci", "upper_ci"
+                  daily_policy="point",
+                  horizon_threshold=0.0,    # e.g. 0.01 for +1% hurdle
+                  daily_threshold=0.0):
+    """
+    fc_prices: DataFrame with MultiIndex columns (ticker, ['forecast','ci_lower','ci_upper'])
+    last_actuals: Series mapping ticker -> last observed price (aligns with your models)
+    model_rank: DataFrame from align_and_forecast (ticker, aic, order)
+    Returns: signals DataFrame indexed by ticker
+    """
+    # pick which column to use for decisions
+    def pick_col(policy):
+        return {"point": "forecast", "lower_ci": "ci_lower", "upper_ci": "ci_upper"}[policy]
+
+    # horizon-side comparison: last forecast row vs last actual
+    horizon_col = pick_col(horizon_policy)
+    daily_col   = pick_col(daily_policy)
+
+    # horizon expected return
+    fc_end = fc_prices.xs(horizon_col, axis=1, level=1).iloc[-1]      # last row per ticker
+    # first-step (next business day) expected return
+    fc_day1 = fc_prices.xs(daily_col, axis=1, level=1).iloc[0]        # first row per ticker
+
+    # align last actuals
+    last_actuals = last_actuals.reindex(fc_end.index)
+
+    # compute returns
+    horizon_ret = (fc_end / last_actuals) - 1.0
+    # For day-1, compare to last actual as well:
+    day1_ret = (fc_day1 / last_actuals) - 1.0
+
+    # signals with thresholds
+    def signal_from_ret(r, th):
+        # +1 if r > th, -1 if r < -th, else 0 (no-trade/flat)
+        return np.where(r > th, 1, np.where(r < -th, -1, 0))
+
+    sig_h = signal_from_ret(horizon_ret, horizon_threshold)
+    sig_d = signal_from_ret(day1_ret,    daily_threshold)
+
+    signals = pd.DataFrame({
+        "exp_horizon_ret": horizon_ret,
+        "exp_day1_ret": day1_ret,
+        "horizon_signal": sig_h,
+        "daily_signal": sig_d,
+    }, index=fc_end.index)
+
+    # add model diagnostics and ARIMA order
+    model_rank = model_rank.set_index("ticker")
+    signals["model_aic"] = model_rank["aic"]
+    signals["order"] = model_rank["order"]
+
+    return signals
+
+# ---------- Wrapper: from your panel to everything you need ----------
+def forecasts_to_returns_and_signals(panel, H,
+                                     horizon_policy="point",
+                                     daily_policy="point",
+                                     horizon_threshold=0.0,
+                                     daily_threshold=0.0):
+    """
+    Runs your align_and_forecast, then derives expected returns and signals.
+    Returns:
+      fc_prices, fc_rets, fc_cumret, signals
+    """
+    fc_prices, model_rank = align_and_forecast(panel, steps=H)
+
+    # Expected daily and cumulative returns from forecast path (per ticker)
+    fc_rets = _to_returns(fc_prices)
+    fc_cumret = _to_cum_returns(fc_rets)
+
+    # Last actual per ticker at the model's last observed date (before common start)
+    # We use each ticker's last valid actual; since align_and_forecast already stored that internally,
+    # we reconstruct it as the last non-NA before the common index begins.
+    common_start = fc_prices.index.min()
+    last_actuals = {}
+    for t in fc_prices.columns.levels[0]:
+        # go to panel; take last actual strictly before common_start
+        if t in panel.columns:
+            s = enforce_bday_freq(panel[t].dropna())
+            s = s[s.index < common_start]
+            if not s.empty:
+                last_actuals[t] = s.iloc[-1]
+    last_actuals = pd.Series(last_actuals)
+
+    # Signals
+    signals = build_signals(
+        fc_prices=fc_prices,
+        last_actuals=last_actuals,
+        model_rank=model_rank,
+        horizon_policy=horizon_policy,
+        daily_policy=daily_policy,
+        horizon_threshold=horizon_threshold,
+        daily_threshold=daily_threshold
+    )
+
+    return fc_prices, fc_rets, fc_cumret, signals
+
+# If you want to run selection + forecasting for many tickers and then
+# plug into your returns/signals pipeline:
+chosen = {}
+frames = []
+last_dates = []
+for t in panel.columns:
+    try:
+        bm, f = forecast_with_best_model(panel, t, horizon=H)
+        chosen[t] = bm
+        # conform to MultiIndex columns expected by your returns/signals code
+        f.columns = pd.MultiIndex.from_product([[t], f.columns])
+        frames.append(f)
+        last_dates.append(enforce_bday_freq(panel[t].dropna()).index.max())
+    except Exception as e:
+        continue
+
+if frames:
+    # Align to a common forecast index like your align_and_forecast does
+    common_start = max(last_dates) + BDay()
+    idx_common = pd.bdate_range(common_start, periods=H)
+    # Reindex each to the common index (forecasts already start at last_date+1B;
+    # if some series lag, this keep the nearest dates; simplest is to just reindex)
+    aligned = []
+    for f in frames:
+        # move forecast to the common index keeping values (no interpolation)
+        g = f.copy()
+        g.index = idx_common  # safe because both length = H
+        aligned.append(g)
+    fc_multi = pd.concat(aligned, axis=1).reindex(idx_common)
+
+    # Now reuse your returns & signals helpers:
+    fc_prices, fc_rets, fc_cumret, signals = forecasts_to_returns_and_signals(
+        panel, H,
+        horizon_policy="point",
+        daily_policy="point",
+        horizon_threshold=0.00,
+        daily_threshold=0.00
+    )
+    # But replace price forecasts with the multi-model forecasts:
+    fc_prices = fc_multi  # uses same (ticker, ['forecast','ci_lower','ci_upper']) structure
+
+    # Recompute returns & signals from these chosen-forecast prices:
+    fc_rets = (fc_prices.xs("forecast", axis=1, level=1)
+                             .pct_change())
+    fc_cumret = (1 + fc_rets).cumprod() - 1
+
+    # Last actuals for signal decisions:
+    common_start = fc_prices.index.min()
+    last_actuals = {}
+    for t in fc_prices.columns.levels[0]:
+        s = enforce_bday_freq(panel[t].dropna())
+        s = s[s.index < common_start]
+        if not s.empty:
+            last_actuals[t] = s.iloc[-1]
+    last_actuals = pd.Series(last_actuals)
+
+    signals = build_signals(
+        fc_prices=fc_prices,
+        last_actuals=last_actuals,
+        model_rank=pd.DataFrame({"ticker": list(chosen.keys()),
+                                 "aic": np.nan,
+                                 "order": ["— "+chosen[t] for t in chosen]}),
+        horizon_policy="point",
+        daily_policy="point",
+        horizon_threshold=0.0,
+        daily_threshold=0.0
+    )
+
+    print("\nCHOSEN MODELS PER TICKER:")
+    print(pd.Series(chosen).sort_index())
+    print("\nSIGNALS FROM CHOSEN MODELS (top by expected horizon return):")
+    print(signals.sort_values("exp_horizon_ret", ascending=False).head(10).to_string())
+else:
+    print("No tickers produced valid forecasts.")
+
+
+fc, model_table = align_and_forecast(panel, steps=H)
+print(EXCEL_PATH)
+print("MODELS (best AIC first):")
+print(model_table.to_string(index=False))
+print("FORECAST (first 5 rows):")
+print(fc.head())
+
+# --- Historical 3-month forecast for SPY from June 1, 2025 ---
+hf, sel = historical_forecast(panel, "SPY", asof_date="2025-06-01", months_ahead=3, use_log=True)
+print("\nHistorical forecast vs actual (SPY, 3 months ahead from 2025-06-01):")
+print(hf.head())
+
+
+# --- Your existing forecast ---
+fc, model_table = align_and_forecast(panel, steps=H)
+
+# --- New: convert to returns and trading signals ---
+fc_prices, fc_rets, fc_cumret, signals = forecasts_to_returns_and_signals(
+    panel, H,
+    horizon_policy="point",
+    daily_policy="point",
+    horizon_threshold=0.00,
+    daily_threshold=0.00
+)
+
+print("\nEXPECTED DAILY RETURNS (first 5 rows):")
+print(fc_rets.head())
+
+print("\nCUMULATIVE EXPECTED RETURNS (first 5 rows):")
+print(fc_cumret.head())
+
+print("\nSIGNALS (sorted by expected horizon return):")
+print(signals.sort_values('exp_horizon_ret', ascending=False).head(10).to_string())
+
+
+# Plot forecast vs actual
+plt.figure()
+hf["actual"].plot(label="Actual")
+hf["forecast"].plot(label="Forecast")
+plt.fill_between(hf.index, hf["ci_lower"], hf["ci_upper"], alpha=0.2, label="95% CI")
+plt.legend(); plt.title("SPY 3-month forecast vs actual (from 2025-06-01)"); plt.show()
+
+# Plot error (difference)
+plt.figure()
+hf["error"].plot(label="Forecast - Actual")
+plt.axhline(0, color="black", linestyle="--")
+plt.legend(); plt.title("Forecast error (SPY, 3-month from 2025-06-01)")
+plt.show()
